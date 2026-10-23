@@ -1,0 +1,181 @@
+import Foundation
+
+var count = 0
+func check(_ condition: @autoclosure () -> Bool, _ message: String) {
+    precondition(condition(), message)
+    count += 1
+}
+for text in ["https://dsh.example.com", "https://dsh.example.com:19387/", " https://mac.local/dsh/ \n", "https://192.168.1.15"] {
+    check(HostAddress.parse(text) != nil, "Must accept \(text)")
+}
+for text in ["", "http://dsh.example.com", "javascript:alert(1)", "file:///etc/passwd", "https://", "https://user:pass@dsh.example.com", "https://dsh.example.com?token=secret", "https://dsh.example.com#secret", "https://localhost", "https://127.0.0.1", "https://[::1]", "https://dsh.example.com:0", "https://dsh.example.com:65536"] {
+    check(HostAddress.parse(text) == nil, "Must reject \(text)")
+}
+let host = URL(string: "https://dsh.example.com")!
+check(HostAddress.sameOrigin(host, URL(string: "https://DSH.example.com:443/chat")!), "Default port and case")
+for other in ["http://dsh.example.com", "https://dsh.example.com:444", "https://evil.example.com", "https://dsh.example.com.evil.test"] {
+    check(!HostAddress.sameOrigin(host, URL(string: other)!), "Must isolate \(other)")
+}
+let key = String(repeating: "a", count: 32)
+check(HostAddress.pairingURL("https://dsh.ymehili.com/__pair#key=\(key)") != nil, "Accept bridge invitation")
+check(HostAddress.pairingURL("https://DSH.ymehili.com:443/__pair#key=\(key)") != nil, "Accept equivalent origin")
+for value in [
+    "https://evil.test/__pair#key=\(key)",
+    "http://dsh.ymehili.com/__pair#key=\(key)",
+    "https://dsh.ymehili.com:444/__pair#key=\(key)",
+    "https://user@dsh.ymehili.com/__pair#key=\(key)",
+    "https://dsh.ymehili.com/__pair?key=\(key)",
+    "https://dsh.ymehili.com/__pair#key=short",
+    "https://dsh.ymehili.com/__pair#key=\(key)&key=\(key)",
+    "https://dsh.ymehili.com/__pair#key=\(key)&other=x",
+    "https://dsh.ymehili.com/other#key=\(key)",
+    "https://dsh.ymehili.com/__pair#key=\(String(repeating: "a", count: 129))",
+    "https://dsh.ymehili.com/__pair#key=\(key)%0A",
+    "https://dsh.ymehili.com.evil.test/__pair#key=\(key)"
+] {
+    check(HostAddress.pairingURL(value) == nil, "Reject unsafe pairing input")
+}
+func json(_ text: String) -> JSONValue { try! JSONDecoder().decode(JSONValue.self, from: Data(text.utf8)) }
+let envelope = json(#"{"type":"server-response","rpcId":"test","result":{"ok":true,"value":{"accepted":true}}}"#)
+check((try? Wire.response(envelope, id: "test"))?["accepted"].bool == true, "Decode correlated RPC")
+check((try? Wire.response(envelope, id: "wrong")) == nil, "Reject mismatched correlation")
+var chat = Conversation()
+chat.accept(json(#"{"type":"snapshot","cursor":3,"hasMore":true,"records":[{"type":"event","event":{"type":"user/message","seq":0,"surfaceOp":"append","data":{"content":[{"type":"text","text":"Hello"}]}}},{"type":"event","event":{"type":"assistant/message","seq":1,"surfaceOp":{"replace":[]},"data":{"message":{"content":[{"type":"text","text":"Hidden replacement"}]}}}},{"type":"event","event":{"type":"turn/start","seq":2,"data":{}}}],"assistantStream":{"revision":0}}"#))
+check(chat.entries.count == 1 && chat.entries[0].text == "Hello", "Retain append-origin messages, hide model replacement")
+check(chat.running && chat.hasMore && chat.cursor == 3, "Read snapshot state")
+chat.accept(json(#"{"type":"assistant-stream","frame":{"type":"start","attemptId":"a","revision":1}}"#))
+chat.accept(json(#"{"type":"assistant-stream","frame":{"type":"chunk","attemptId":"a","revision":2,"index":0,"chunk":{"type":"text-delta","index":0,"text":"Hi"}}}"#))
+check(chat.streamingText == "Hi", "Stream text delta")
+chat.accept(json(#"{"type":"assistant-stream","frame":{"type":"chunk","attemptId":"a","revision":2,"index":0,"chunk":{"type":"text-delta","index":0,"text":"Hi"}}}"#))
+check(chat.streamingText == "Hi", "Ignore duplicate frames")
+chat.accept(json(#"{"type":"assistant-stream","frame":{"type":"end","attemptId":"a","revision":3,"index":1,"outcome":{"kind":"committed","seq":3}}}"#))
+check(chat.streamingText == "Hi", "Retain transient output until durable settlement arrives")
+chat.accept(json(#"{"type":"event","event":{"type":"assistant/message","seq":3,"surfaceOp":"append","data":{"message":{"content":[{"type":"text","text":"Hi"}]}}}}"#))
+check(chat.streamingText.isEmpty && chat.entries.count == 2, "Settle without duplicated reply")
+chat.accept(json(#"{"type":"assistant-stream","frame":{"type":"start","attemptId":"b","revision":9}}"#))
+check(chat.needsBaseline, "Detect revision gap")
+var baseline = Conversation()
+baseline.accept(json(#"{"type":"snapshot","cursor":0,"records":[],"assistantStream":{"revision":4,"activeAttempt":{"attemptId":"x","nextIndex":2,"stream":[{"type":"text-chunks","index":0,"texts":["a","b"]},{"type":"reasoning-chunks","index":1,"texts":["r"]}]}}}"#))
+check(baseline.streamingText == "ab" && baseline.streamingReasoning == "r", "Expand compact snapshot stream")
+baseline.accept(json(#"{"type":"assistant-stream","frame":{"type":"chunk","revision":5,"attemptId":"x","index":9,"chunk":{}}}"#))
+check(baseline.needsBaseline, "Detect stream index gap")
+let row = SessionRow(json(#"{"sessionId":"s","updatedAt":1000,"running":false,"projections":{"values":{"title":"Native chat"}}}"#))
+check(row?.title == "Native chat", "Read projected session title")
+var orphan = Conversation()
+orphan.accept(json(#"{"type":"snapshot","cursor":0,"records":[],"assistantStream":{"revision":0}}"#))
+orphan.accept(json(#"{"type":"assistant-stream","frame":{"type":"chunk","attemptId":"missing","revision":1,"index":9,"chunk":{}}}"#))
+check(!orphan.needsBaseline && orphan.streamingText.isEmpty, "Ignore unknown attempts without refollow storms")
+orphan.accept(json(#"{"type":"assistant-stream","frame":{"type":"start","attemptId":"reset","revision":1}}"#))
+check(orphan.needsBaseline, "Rebaseline when host revision resets")
+var runningHistory = Conversation()
+runningHistory.accept(json(#"{"type":"snapshot","cursor":11,"records":[{"type":"event","event":{"type":"turn/start","seq":10,"data":{}}}]}"#))
+runningHistory.prepend([json(#"{"type":"event","event":{"type":"turn/end","seq":2,"data":{}}}"#)])
+check(runningHistory.running, "Old history cannot stop a live turn")
+check(json("1e100").integer == nil && json("1.5").integer == nil, "Reject unsafe integer conversions")
+var retries = PromptRetries()
+let first = retries.prepare(session: "a", text: "Hello", image: nil)
+check(first == retries.prepare(session: "a", text: "Hello", image: nil), "Retry reuses prompt requestId")
+check(first != retries.prepare(session: "b", text: "Hello", image: nil), "Retry identity is scoped to session")
+let changed = retries.prepare(session: "a", text: "Changed", image: nil)
+check(changed != first, "Changed draft receives new requestId")
+check(changed != retries.prepare(session: "a", text: "Changed", image: Data([1])), "Attachment changes retry identity")
+retries.acknowledged(session: "b", id: "not-the-request")
+check(retries.prepare(session: "b", text: "Hello", image: nil) != first, "Stale ack does not cross sessions")
+check(DesktopInbox.section(record: json(#"{"settledOverride":"settled","facts":{"completedAt":100}}"#), running: false) == "settled", "Use Mac's explicit settled lifecycle")
+check(DesktopInbox.section(record: json(#"{"facts":{"backgroundWork":true}}"#), running: false) == "working", "Background work belongs to Working")
+check(DesktopInbox.status(record: json(#"{"facts":{"running":false,"backgroundWork":true}}"#), running: false) == "Working", "Background work not hidden by false running")
+check(DesktopInbox.section(record: json(#"{"facts":{"running":true,"pending":[{"kind":"approval"}]}}"#), running: true) == "inbox", "Approval raises hand in Inbox")
+check(DesktopInbox.status(record: json(#"{"facts":{"pending":[{"kind":"approval"}]}}"#), running: false) == "Approval", "Approval status matches Mac")
+check(DesktopInbox.section(record: json(#"{"pinnedAt":1,"facts":{}}"#), running: false) == "pinned", "Pinned shelf comes from Mac state")
+check(DesktopInbox.section(record: json(#"{"snoozedAt":10,"snoozedUntil":100,"facts":{}}"#), running: false, now: 50) == "snoozed", "Respect active snooze")
+check(DesktopInbox.section(record: json(#"{"snoozedAt":10,"snoozedUntil":100,"facts":{"completedAt":20}}"#), running: false, now: 50) == "inbox", "Completion wakes snoozed item")
+check(DesktopInbox.section(record: json(#"{"facts":{"archived":true}}"#), running: false) == "hidden", "Hide archived threads")
+let models = NativeModelChoice.catalog(json(#"{"groups":[{"id":"p","name":"Provider","models":[{"id":"m","name":"Model","reasoning":{"defaultEffort":"high","efforts":[{"id":"high","name":"High"}]}}]}]}"#))
+check(models.first?.name == "Model" && models.first?.efforts.first?.id == "high", "Decode real model catalog and effort options")
+check(DesktopInbox.precedes(json(#"{"returnedAt":100}"#), idA: "a", json(#"{"facts":{"lastSendAt":50}}"#), idB: "b", shelf: "inbox"), "Inbox uses Mac return/activity order")
+check(DesktopInbox.precedes(json(#"{"snoozedUntil":10}"#), idA: "a", json(#"{"snoozedUntil":20}"#), idB: "b", shelf: "snoozed"), "Snoozed uses earliest wake first")
+check(DesktopInbox.precedes(json(#"{"settledAt":20}"#), idA: "a", json(#"{"settledAt":10}"#), idB: "b", shelf: "settled"), "Settled uses latest settled first")
+check(DesktopInbox.precedes(json(#"{"pinOrderKey":"ab"}"#), idA: "z", json(#"{"pinOrderKey":"ac"}"#), idB: "a", shelf: "pinned"), "Pinned preserves Mac explicit ordering")
+var inbox = InboxReplica()
+check(!inbox.hasSnapshot && inbox.watchRequest == nil, "Do not invent first-load shelf state")
+check(inbox.apply(json(#"{"full":true,"epoch":"mac-a","revision":1,"settings":{"activated":true},"threads":{"a":{"settledOverride":"settled"}}}"#)), "Accept real Mac shelf snapshot")
+check(inbox.hasSnapshot && inbox.activated && inbox.threads["a"]?["settledOverride"].string == "settled", "Keep explicit Mac lifecycle")
+check(!inbox.apply(json(#"{"error":"unavailable"}"#)) && inbox.activated && inbox.threads.count == 1, "Malformed/failed response cannot clear last-good shelves")
+check(inbox.apply(json(#"{"full":false,"epoch":"mac-a","revision":2,"threads":{"b":{"facts":{"running":true}}}}"#)) && inbox.threads.count == 2, "Merge watch deltas without losing other shelves")
+check(!inbox.apply(json(#"{"full":true,"epoch":"mac-a","revision":0,"settings":{"activated":false},"threads":{}}"#)) && inbox.activated, "Ignore stale full snapshots")
+check(!inbox.apply(json(#"{"full":false,"epoch":"wrong-mac","revision":3,"threads":{}}"#)), "Reject a foreign-epoch delta")
+check(inbox.watchRequest?["revision"].integer == 2, "Watch resumes from last applied revision")
+check(inbox.apply(json(#"{"full":true,"epoch":"mac-b","revision":0,"settings":{"activated":true},"threads":{"c":{}}}"#)) && inbox.threads.count == 1 && inbox.threads["a"] == nil, "Host restart rebases with a valid new epoch")
+var contextChat = Conversation()
+contextChat.accept(json(#"{"type":"snapshot","cursor":2,"records":[{"type":"event","event":{"type":"user/message","seq":0,"surfaceOp":"append","data":{"source":{"kind":"user"},"content":[{"type":"text","text":"Hi"}]}}},{"type":"event","event":{"type":"user/message","seq":1,"surfaceOp":"append","data":{"source":{"kind":"goal","summary":"Continue"},"content":[{"type":"text","text":"internal notice"}]}}}],"assistantStream":{"revision":0}}"#))
+check(contextChat.entries.map(\.role) == ["user", "context"], "Injected context never masquerades as human input")
+let transcriptVersion = contextChat.transcriptRevision
+contextChat.accept(json(#"{"type":"assistant-stream","frame":{"type":"start","attemptId":"q","revision":1}}"#))
+contextChat.accept(json(#"{"type":"assistant-stream","frame":{"type":"chunk","attemptId":"q","revision":2,"index":0,"chunk":{"type":"text-delta","index":0,"text":"x"}}}"#))
+check(contextChat.transcriptRevision == transcriptVersion && contextChat.streamingText == "x", "Streaming does not rebuild cached history")
+check(MarkdownParser.parse("# Title\n\n```swift\nlet a = 1\n```") == [.heading(level: 1, text: "Title"), .code(language: "swift", code: "let a = 1", closed: true)], "Native headings and fenced code")
+check(MarkdownParser.parse("```py\nprint(1)").last == .code(language: "py", code: "print(1)", closed: false), "Incomplete streamed fence remains code")
+check(MarkdownInline.attributed("[safe](https://ok.example) [bad](file:///etc/passwd) [unsafe](javascript:alert(1)) [creds](https://u:p@x.example)").runs.compactMap { $0.link?.absoluteString } == ["https://ok.example"], "Markdown link safety")
+check(MarkdownInline.attributed("![alt](https://image.example/a.png)").runs.allSatisfy { $0.imageURL == nil }, "Markdown images never auto-fetch")
+var photos = AttachmentDrafts()
+let oldPhoto = photos.begin("a"), newPhoto = photos.begin("a")
+check(!photos.finish("a", token: oldPhoto, data: Data([1])) && photos.isLoading("a"), "Old photo completion cannot override a newer selection")
+check(photos.finish("a", token: newPhoto, data: Data([2])) && photos["a"] == Data([2]), "Newest photo is retained")
+let removedPhoto = photos.begin("a"); photos.remove("a")
+check(!photos.finish("a", token: removedPhoto, data: Data([3])) && photos["a"] == nil, "Removed photos cannot reappear after async decode")
+let otherPhoto = photos.begin("b"); _ = photos.finish("b", token: otherPhoto, data: Data([4]))
+check(photos["b"] == Data([4]) && photos["a"] == nil, "Photo drafts are session scoped")
+var registry = WorkspaceReplica()
+registry.accept(json(#"{"type":"baseline","value":{"items":[{"workspaceId":"w","title":"Actual project title","sessionIds":["visible"]}],"archivedSessionIds":["archived"],"pinnedSessionIds":[]}}"#))
+let blankRow = SessionRow(json(#"{"sessionId":"blank","blank":true}"#))!
+let archivedRow = SessionRow(json(#"{"sessionId":"archived","blank":false}"#))!
+let visibleRow = SessionRow(json(#"{"sessionId":"visible","updatedAt":123,"running":true}"#))!
+check(registry.ready && !registry.visible(blankRow, current: nil), "Exclude blank sessions like Mac, even without Inbox records")
+check(registry.visible(blankRow, current: "blank"), "Only current blank placeholder stays visible")
+check(!registry.visible(archivedRow, current: nil), "Registry archives hide sessions even if Inbox record is missing")
+check(registry.visible(visibleRow, current: nil) && registry.title(for: "visible", cwd: "/other") == "Actual project title", "Use real workspace title/membership")
+registry.accept(json(#"{"type":"archived","archivedSessionIds":["visible"]}"#))
+check(!registry.visible(visibleRow, current: nil), "Live archive events update visibility")
+registry.accept(json(#"{"type":"baseline","value":{}}"#))
+check(!registry.visible(visibleRow, current: nil), "Malformed baseline cannot clear valid archive data")
+check(DesktopInbox.section(record: json(#"{"facts":{}}"#), running: true) == "inbox", "Existing Mac facts are not overwritten by summary-running fallback")
+let fallback = DesktopInbox.resolvedRecord(.null, row: visibleRow)
+check(DesktopInbox.section(record: fallback, running: true) == "working" && fallback["facts"]["lastSendAt"].number == 123, "Only missing facts use native row fallback")
+var multi = AttachmentDrafts()
+let limit = PhotoLimits(json(#"{"maxImagesPerMessage":3,"maxImageBytes":4,"maxMessageImageBytes":8}"#))
+let batch = multi.begin("photos")
+let addedFirstPhoto = try multi.append("photos", token: batch, data: Data([1,2]), limits: limit)
+let addedSecondPhoto = try multi.append("photos", token: batch, data: Data([3,4]), limits: limit)
+check(addedFirstPhoto, "Append first photo")
+check(addedSecondPhoto, "Append second photo without replacing first")
+_ = multi.finish("photos", token: batch, data: nil)
+check(multi.photos(in: "photos").map(\.data) == [Data([1,2]),Data([3,4])], "Keep picker order")
+let nextBatch = multi.begin("photos")
+_ = try multi.append("photos", token: nextBatch, data: Data([5]), limits: limit)
+_ = multi.finish("photos", token: nextBatch, data: nil)
+check(multi.photos(in: "photos").count == 3, "A later picker batch adds instead of replacing")
+let firstID = multi.photos(in: "photos")[0].id
+multi.remove("photos", photoID: firstID)
+check(multi.photos(in: "photos").map(\.data) == [Data([3,4]),Data([5])], "Remove only the chosen photo, preserving the rest/order")
+let canceled = multi.begin("photos"); multi.cancelLoading("photos")
+let resurrectedPhoto = try multi.append("photos", token: canceled, data: Data([6]), limits: limit)
+check(!resurrectedPhoto, "Canceled batch cannot resurrect photos")
+check(multi.photos(in: "photos").count == 2, "Cancel loading keeps completed attachments")
+func rejectsPhotos(_ images: [Data], _ policy: PhotoLimits) -> Bool { do { try policy.validate(images); return false } catch { return true } }
+check(rejectsPhotos([Data([1]),Data([2]),Data([3]),Data([4])], limit), "Validate host image-count limit")
+check(rejectsPhotos([Data(repeating: 1, count: 5)], limit), "Validate per-image byte limit")
+check(rejectsPhotos([Data(repeating: 1, count: 4),Data(repeating: 2, count: 4),Data([3])], limit), "Validate combined image byte limit")
+var photoRetries = PromptRetries()
+let photoRequest = photoRetries.prepare(session: "s", text: "", images: [Data([1]),Data([2])])
+check(photoRequest == photoRetries.prepare(session: "s", text: "", images: [Data([1]),Data([2])]), "Ordered multi-photo retry reuses ID")
+check(photoRequest != photoRetries.prepare(session: "s", text: "", images: [Data([2]),Data([1])]), "Reordering photos is a different intent")
+let separated = photoRetries.prepare(session: "b", text: "", images: [Data([1]),Data([2,3])])
+check(separated != photoRetries.prepare(session: "b", text: "", images: [Data([1,2]),Data([3])]), "Image boundaries are part of retry fingerprint")
+let canonicalImages = json(#"[{"type":"text","text":"Compare"},{"type":"image","attachment":{"attachmentId":"owned-ref","mediaType":"image/jpeg","bytes":120,"width":80,"height":60,"name":"Photo.jpg","originalDimensions":{"width":800,"height":600}}},{"type":"image","offloaded":true,"attachment":{"attachmentId":"owned-ref","mediaType":"image/jpeg","bytes":120,"width":80,"height":60}}]"#)
+let historicalRefs = ChatImageReference.references(in: canonicalImages)
+check(historicalRefs.count == 2 && historicalRefs.map(\.contentIndex) == [1,2], "Historical refs retain image order/content positions")
+check(historicalRefs[0].name == "Photo.jpg" && historicalRefs[0].originalDimensions?.width == 800, "Read canonical nested filename/original dimensions")
+check(historicalRefs[0].id != historicalRefs[1].id, "Repeated attachment reference has distinct message-block identity")
+check(ChatImageReference.references(in: json(#"[{"type":"image","url":"https://example.com/private.jpg"}]"#)).isEmpty, "Remote Markdown/URL parts never become authenticated image refs")
+check(ChatImageReference(attachment: json(#"{"attachmentId":"a","mediaType":"image/jpeg","bytes":0,"width":10,"height":10}"#), contentIndex: 0) == nil, "Reject invalid historical image descriptors")
+print("Passed \(count) native protocol, rendering, historical-image and security checks")

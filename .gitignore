@@ -1,0 +1,22 @@
+# Local build output and development state
+build/
+build-device/
+DerivedData/
+.dsh/
+VaultDeviceQA/
+*.xcuserstate
+xcuserdata/
+.DS_Store
+
+# Historical source exports and signing material
+*.zip
+*.ipa
+*.dSYM/
+*.xcarchive/
+*.mobileprovision
+*.provisionprofile
+*.p12
+*.p8
+*.key
+.env
+.env.*

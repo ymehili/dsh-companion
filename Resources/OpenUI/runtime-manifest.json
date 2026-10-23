@@ -1,0 +1,22 @@
+{
+  "package": "dsh-openui",
+  "version": "0.5.1",
+  "upstream": {
+    "package": "@openuidev/browser-bundle",
+    "version": "0.2.1"
+  },
+  "catalogs": [
+    "chat-v1",
+    "intelligent-v1"
+  ],
+  "protocol": 2,
+  "files": {
+    "index.html": "dfee8bc93e5976234dd2187d98858139509a33a510aee5f81c286898acb722ed",
+    "frame.js": "a676f33b6518e1ec3535b4208f53bbcd64633ea69facf3ea67fa6baf7594670d",
+    "openui-bundle.min.js": "de4d5030b7788bebd2ab9de5acf602845b69ef2bee0e79e60e895b2774de8e7b",
+    "openui-styles.css": "0645703253277d8792bbbef0beb39f9285f0c5d3a189f42ed6cb195571af25ec",
+    "OPENUI-LICENSE": "b6bdd2d3d161722fb3f3afc039114cfa9f3236f036e1c98e0853bc3a85f6cd9e",
+    "intelligent-LICENSE.txt": "6a80812aaac41dad15278a213129a58c40bf74383b7986f6705075569e5ff72b",
+    "intelligent-third-party-notices.txt": "4e98979291dbd73209435c6ae288e529c0884b9f9a22a204aebdb79d5775a862"
+  }
+}
